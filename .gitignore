@@ -1,0 +1,16 @@
+# Sensitive — never commit your live config with real passwords
+pimonitor.conf
+/etc/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

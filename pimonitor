@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# =============================================================================
+# PiMonitor — RTSP camera display daemon
+# =============================================================================
+# Pure Bash + mpv. No Python, no Node, no framework.
+# Supports Raspberry Pi 4/5 and any modern Linux with mpv installed.
+#
+# Usage:
+#   pimonitor                       run as daemon (managed by systemd)
+#   pimonitor status                show running streams and their PIDs
+#   pimonitor rotate                advance to next page immediately
+#   pimonitor repair                restart any dead streams
+# =============================================================================
+
+set -uo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+CONFIG_FILE="${PIMONITOR_CONFIG:-/etc/pimonitor/pimonitor.conf}"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "[ERROR] Config file not found: $CONFIG_FILE"
+    echo "        Copy the example:  sudo cp /opt/pimonitor/pimonitor.conf.example $CONFIG_FILE"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULTS  (all overridable in pimonitor.conf)
+# ─────────────────────────────────────────────────────────────────────────────
+XDISPLAY="${XDISPLAY:-:0}"
+SCREEN_WIDTH="${SCREEN_WIDTH:-auto}"
+SCREEN_HEIGHT="${SCREEN_HEIGHT:-auto}"
+
+GRID_COLS="${GRID_COLS:-2}"
+GRID_ROWS="${GRID_ROWS:-2}"
+WINDOW_GAP="${WINDOW_GAP:-2}"
+
+ROTATION_INTERVAL="${ROTATION_INTERVAL:-30}"   # seconds (0 = off)
+ROTATION_ON_START="${ROTATION_ON_START:-no}"   # yes/no — start from page 0 or resume
+
+HWDEC="${HWDEC:-auto}"
+RTSP_TRANSPORT="${RTSP_TRANSPORT:-tcp}"
+RECONNECT_DELAY="${RECONNECT_DELAY:-5}"
+STARTUP_DELAY="${STARTUP_DELAY:-1}"
+BUFFER_SIZE="${BUFFER_SIZE:-512k}"
+NETWORK_TIMEOUT="${NETWORK_TIMEOUT:-30}"
+HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"        # seconds between watchdog checks
+
+LOG_LEVEL="${LOG_LEVEL:-info}"                 # info | debug
+LOG_FILE="${LOG_FILE:-}"                        # empty = journald only
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATE  (runtime, not config)
+# ─────────────────────────────────────────────────────────────────────────────
+RUNDIR="/run/pimonitor"
+SEQFILE="$RUNDIR/page"          # current page index
+declare -a ACTIVE_PIDS=()       # slot → mpv PID
+declare -a ACTIVE_CAM=()        # slot → camera index
+declare -a POSITIONS=()         # slot → "X Y W H"
+CURRENT_PAGE=0
+COMPUTED_HWDEC=""
+NUM_PAGES=0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+_log() {
+    local level="$1"; shift
+    local ts; ts=$(date '+%Y-%m-%dT%H:%M:%S')
+    local line="[$ts] [$level] $*"
+    echo "$line"
+    [[ -n "$LOG_FILE" ]] && echo "$line" >> "$LOG_FILE"
+}
+log_info()  { _log "INFO " "$@"; }
+log_debug() { [[ "$LOG_LEVEL" == "debug" ]] && _log "DEBUG" "$@" || true; }
+log_warn()  { _log "WARN " "$@" >&2; }
+log_err()   { _log "ERROR" "$@" >&2; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HARDWARE DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+_detect_hwdec() {
+    if [[ "$HWDEC" != "auto" ]]; then
+        echo "$HWDEC"
+        return
+    fi
+
+    local model="" hardware=""
+    model=$(cat /sys/firmware/devicetree/base/model 2>/dev/null | tr -d '\0' || true)
+    hardware=$(grep -oP '(?<=^Hardware\s{1,8}:\s)(\S+)' /proc/cpuinfo 2>/dev/null | head -1 || true)
+
+    if [[ -n "$model" ]] && echo "$model" | grep -qi "raspberry pi"; then
+        case "$hardware" in
+            BCM2712) echo "v4l2m2m" ;;   # Pi 5 — VideoCore VII
+            BCM2711) echo "v4l2m2m" ;;   # Pi 4 — V4L2 M2M
+            BCM2837) echo "v4l2m2m" ;;   # Pi 3 — try V4L2, fallback in mpv
+            *)       echo "v4l2m2m" ;;   # unknown Pi, try anyway
+        esac
+    elif [[ -e /dev/dri/renderD128 ]]; then
+        echo "vaapi"                      # Intel / AMD on x86
+    else
+        echo "auto-safe"                  # let mpv decide
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPLAY SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+_setup_display() {
+    export DISPLAY="$XDISPLAY"
+
+    # Set black background to hide X11 default grey/checker
+    xsetroot -solid black 2>/dev/null || true
+
+    # Disable screensaver / DPMS blanking
+    xset s off     2>/dev/null || true
+    xset -dpms     2>/dev/null || true
+    xset s noblank 2>/dev/null || true
+
+    # Auto-detect resolution if not set in config
+    if [[ "$SCREEN_WIDTH" == "auto" || "$SCREEN_HEIGHT" == "auto" ]]; then
+        local res
+        res=$(xrandr --current 2>/dev/null | grep -oP '\d+x\d+(?=\+0\+0)' | head -1 || true)
+        if [[ -n "$res" ]]; then
+            SCREEN_WIDTH="${res%%x*}"
+            SCREEN_HEIGHT="${res##*x}"
+            log_info "Display: ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (auto-detected)"
+        else
+            SCREEN_WIDTH=1920; SCREEN_HEIGHT=1080
+            log_warn "Could not detect resolution, defaulting to ${SCREEN_WIDTH}x${SCREEN_HEIGHT}"
+        fi
+    else
+        log_info "Display: ${SCREEN_WIDTH}x${SCREEN_HEIGHT} (from config)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYOUT — build the POSITIONS array
+# ─────────────────────────────────────────────────────────────────────────────
+_build_positions() {
+    # If WINDOW_POSITIONS is defined in config, use it directly (custom layout)
+    if [[ ${#WINDOW_POSITIONS[@]:-0} -gt 0 ]]; then
+        POSITIONS=("${WINDOW_POSITIONS[@]}")
+        log_info "Layout: custom (${#POSITIONS[@]} slot(s))"
+        return
+    fi
+
+    # Auto-calculate even grid
+    local gap=$WINDOW_GAP
+    local total_gap_x=$(( gap * (GRID_COLS - 1) ))
+    local total_gap_y=$(( gap * (GRID_ROWS - 1) ))
+    local cell_w=$(( (SCREEN_WIDTH  - total_gap_x) / GRID_COLS ))
+    local cell_h=$(( (SCREEN_HEIGHT - total_gap_y) / GRID_ROWS ))
+
+    POSITIONS=()
+    local row col
+    for (( row=0; row<GRID_ROWS; row++ )); do
+        for (( col=0; col<GRID_COLS; col++ )); do
+            local x=$(( col * (cell_w + gap) ))
+            local y=$(( row * (cell_h + gap) ))
+            POSITIONS+=("$x $y $cell_w $cell_h")
+        done
+    done
+    log_info "Layout: ${GRID_COLS}x${GRID_ROWS} grid | cell ${cell_w}x${cell_h} | gap ${gap}px"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA CONTROL
+# ─────────────────────────────────────────────────────────────────────────────
+_start_one() {
+    local slot="$1"
+    local cam_idx="$2"
+    local url="${CAMERAS[$cam_idx]}"
+    local name="${CAMERA_NAMES[$cam_idx]:-Cam_$((cam_idx+1))}"
+    local pos="${POSITIONS[$slot]}"
+    read -r px py pw ph <<< "$pos"
+
+    log_info "  Slot $slot → '${name}' at ${pw}x${ph}+${px}+${py}"
+    log_debug "    URL: $url"
+    log_debug "    hwdec: $COMPUTED_HWDEC | rtsp: $RTSP_TRANSPORT | buf: $BUFFER_SIZE"
+
+    DISPLAY="$XDISPLAY" mpv \
+        --no-config \
+        --no-border \
+        --no-osd-bar \
+        --no-osd-level \
+        --no-input-default-bindings \
+        --no-input-vo-keyboard \
+        --keepaspect=no \
+        --ontop \
+        --hwdec="$COMPUTED_HWDEC" \
+        --rtsp-transport="$RTSP_TRANSPORT" \
+        --network-timeout="$NETWORK_TIMEOUT" \
+        --stream-buffer-size="$BUFFER_SIZE" \
+        --demuxer-max-bytes=128MiB \
+        --demuxer-readahead-secs=3 \
+        --loop \
+        --title="pimonitor:${name}" \
+        --geometry="${pw}x${ph}+${px}+${py}" \
+        -- "$url" \
+        </dev/null >/dev/null 2>&1 &
+
+    ACTIVE_PIDS[$slot]=$!
+    ACTIVE_CAM[$slot]=$cam_idx
+}
+
+_stop_all() {
+    local pids=()
+    for pid in "${ACTIVE_PIDS[@]+"${ACTIVE_PIDS[@]}"}"; do
+        [[ -n "$pid" ]] && pids+=("$pid")
+    done
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        ACTIVE_PIDS=(); ACTIVE_CAM=()
+        return
+    fi
+
+    # Graceful SIGTERM
+    kill "${pids[@]}" 2>/dev/null || true
+    sleep 1
+
+    # Force-kill anything still alive
+    for pid in "${pids[@]}"; do
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    done
+
+    ACTIVE_PIDS=()
+    ACTIVE_CAM=()
+}
+
+_start_page() {
+    local page="$1"
+    local total="${#CAMERAS[@]}"
+    local slots="${#POSITIONS[@]}"
+    local first=$(( page * slots ))
+    local last=$(( first + slots - 1 ))
+    [[ $last -ge $total ]] && last=$(( total - 1 ))
+
+    _stop_all
+
+    log_info "Page $((page+1))/${NUM_PAGES}: cameras $((first+1))–$((last+1)) of ${total}"
+
+    local slot=0
+    for (( i=first; i<=last; i++ )); do
+        _start_one "$slot" "$i"
+        (( slot++ ))
+        [[ "$slot" -lt "$((last - first + 1))" ]] && sleep "$STARTUP_DELAY"
+    done
+
+    echo "$page" > "$SEQFILE"
+}
+
+_repair() {
+    local total="${#CAMERAS[@]}"
+    local slots="${#POSITIONS[@]}"
+    local first=$(( CURRENT_PAGE * slots ))
+
+    for slot in "${!ACTIVE_PIDS[@]}"; do
+        local pid="${ACTIVE_PIDS[$slot]:-}"
+        [[ -z "$pid" ]] && continue
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            local cam_idx="${ACTIVE_CAM[$slot]:-}"
+            [[ -z "$cam_idx" ]] && continue
+            local name="${CAMERA_NAMES[$cam_idx]:-Cam_$((cam_idx+1))}"
+            log_warn "  '${name}' (pid $pid) died — reconnecting in ${RECONNECT_DELAY}s"
+            sleep "$RECONNECT_DELAY"
+            _start_one "$slot" "$cam_idx"
+        fi
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBCOMMANDS  (pimonitor status / rotate / repair)
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_status() {
+    if [[ ! -d "$RUNDIR" ]] || ! ls "$RUNDIR"/*.pid 2>/dev/null | grep -q .; then
+        echo "PiMonitor: not running"
+        exit 1
+    fi
+    echo "PiMonitor — running streams:"
+    # List all mpv processes with pimonitor: in the title
+    pgrep -a mpv 2>/dev/null | grep "pimonitor:" | while read -r pid rest; do
+        local name; name=$(echo "$rest" | grep -oP '(?<=pimonitor:)\S+')
+        echo "  PID $pid  →  $name"
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLEANUP
+# ─────────────────────────────────────────────────────────────────────────────
+_cleanup() {
+    log_info "Shutting down PiMonitor..."
+    _stop_all
+    rm -f "$SEQFILE"
+    exit 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+    # Subcommands
+    case "${1:-}" in
+        status) cmd_status; return ;;
+        "") ;;  # daemon mode — fall through
+        *) echo "Usage: pimonitor [status]"; exit 1 ;;
+    esac
+
+    # --- validation ----------------------------------------------------------
+    if [[ ${#CAMERAS[@]:-0} -eq 0 ]]; then
+        log_err "No cameras defined in $CONFIG_FILE"
+        exit 1
+    fi
+
+    # --- init ----------------------------------------------------------------
+    mkdir -p "$RUNDIR"
+    [[ -n "$LOG_FILE" ]] && mkdir -p "$(dirname "$LOG_FILE")"
+
+    trap '_cleanup' SIGTERM SIGINT
+
+    log_info "──────────────────────────────────────────"
+    log_info " PiMonitor starting"
+    log_info " Config  : $CONFIG_FILE"
+    log_info " Cameras : ${#CAMERAS[@]}"
+    log_info "──────────────────────────────────────────"
+
+    # --- hardware ------------------------------------------------------------
+    COMPUTED_HWDEC=$(_detect_hwdec)
+    log_info "Hardware decode: $COMPUTED_HWDEC"
+
+    # --- display -------------------------------------------------------------
+    _setup_display
+
+    # --- layout --------------------------------------------------------------
+    _build_positions
+
+    NUM_PAGES=$(( (${#CAMERAS[@]} + ${#POSITIONS[@]} - 1) / ${#POSITIONS[@]} ))
+    log_info "Pages: ${NUM_PAGES} (${#POSITIONS[@]} slot(s) per page)"
+
+    # Resume from last page if the runfile exists (survives soft restarts)
+    if [[ "${ROTATION_ON_START:-no}" == "no" ]] && [[ -f "$SEQFILE" ]]; then
+        CURRENT_PAGE=$(cat "$SEQFILE" 2>/dev/null || echo 0)
+        (( CURRENT_PAGE >= NUM_PAGES )) && CURRENT_PAGE=0
+        log_info "Resuming from page $((CURRENT_PAGE+1))"
+    fi
+
+    # --- start ---------------------------------------------------------------
+    _start_page "$CURRENT_PAGE"
+    local LAST_ROTATE
+    LAST_ROTATE=$(date +%s)
+
+    # --- event loop ----------------------------------------------------------
+    while true; do
+        sleep "$HEALTH_INTERVAL"
+
+        # Watchdog
+        _repair
+
+        # Rotation
+        if [[ $ROTATION_INTERVAL -gt 0 ]] && [[ $NUM_PAGES -gt 1 ]]; then
+            local now; now=$(date +%s)
+            local elapsed=$(( now - LAST_ROTATE ))
+            if (( elapsed >= ROTATION_INTERVAL )); then
+                CURRENT_PAGE=$(( (CURRENT_PAGE + 1) % NUM_PAGES ))
+                log_info "Rotating → page $((CURRENT_PAGE+1))/${NUM_PAGES}"
+                _start_page "$CURRENT_PAGE"
+                LAST_ROTATE=$now
+            fi
+        fi
+    done
+}
+
+main "$@"

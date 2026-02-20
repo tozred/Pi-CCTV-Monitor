@@ -1,0 +1,54 @@
+# =============================================================================
+# PiMonitor systemd service
+# =============================================================================
+# Starts PiMonitor on boot as a kiosk X session.
+# Uses startx with PAM login so the user can open Xorg without root.
+# =============================================================================
+
+[Unit]
+Description=PiMonitor Camera Display
+Documentation=https://github.com/benberlin85/PiMonitor
+After=multi-user.target network-online.target
+Wants=multi-user.target
+
+[Service]
+Type=simple
+User=__RUN_USER__
+Group=__RUN_USER__
+
+# PAM login session — grants VT access so Xorg can run as non-root
+PAMName=login
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty1
+UtmpMode=user
+
+# X session type
+Environment=XDG_SESSION_TYPE=x11
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR=1
+Environment=HOME=/home/__RUN_USER__
+Environment=PIMONITOR_CONFIG=__CONFIG_DIR__/pimonitor.conf
+
+# Short wait so the display is ready before X starts
+ExecStartPre=/bin/sleep 3
+
+# Start X and immediately run the PiMonitor xinitrc (no desktop, no WM)
+ExecStart=/usr/bin/startx __INSTALL_DIR__/xinitrc -- :0 vt1 -nocursor -nolisten tcp
+
+# Restart on crash (e.g. X server killed, network error)
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pimonitor
+
+# Allow many open file descriptors for concurrent streams
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

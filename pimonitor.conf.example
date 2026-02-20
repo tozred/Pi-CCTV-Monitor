@@ -1,0 +1,210 @@
+# =============================================================================
+# PiMonitor Configuration
+# =============================================================================
+# Copy to /etc/pimonitor/pimonitor.conf and edit.
+#
+# This file is sourced as Bash, so normal Bash syntax applies.
+# =============================================================================
+
+
+# =============================================================================
+# CAMERAS
+# =============================================================================
+# List of RTSP (or HTTP) stream URLs.
+# Each entry is a quoted URL string.
+# Order matters — cameras are laid out in the grid left-to-right, top-to-bottom,
+# then wrapped onto the next page if there are more than grid slots.
+#
+# Common URL formats:
+#   rtsp://USER:PASS@IP/path         — most IP cameras
+#   rtsp://IP/path                   — no auth
+#   http://IP/video.cgi              — MJPEG over HTTP
+
+CAMERAS=(
+    "rtsp://admin:password@192.168.1.10/stream2"
+    "rtsp://admin:password@192.168.1.11/stream2"
+    "rtsp://admin:password@192.168.1.12/stream2"
+    "rtsp://admin:password@192.168.1.13/stream2"
+    "rtsp://admin:password@192.168.1.14/stream2"
+    "rtsp://admin:password@192.168.1.15/stream2"
+)
+
+# Display names shown in the logs (optional — must match CAMERAS array order)
+CAMERA_NAMES=(
+    "Front Door"
+    "Backyard"
+    "Garage"
+    "Driveway"
+    "Side Gate"
+    "Porch"
+)
+
+
+# =============================================================================
+# DISPLAY
+# =============================================================================
+
+# X11 display number
+XDISPLAY=":0"
+
+# Screen resolution.
+# "auto" detects via xrandr (recommended).
+# Set manually only if auto-detection fails:
+SCREEN_WIDTH="auto"
+SCREEN_HEIGHT="auto"
+# SCREEN_WIDTH=1920
+# SCREEN_HEIGHT=1080
+
+
+# =============================================================================
+# LAYOUT
+# =============================================================================
+# Two modes available:
+#
+#   MODE A — Auto grid (simple, fills the screen evenly)
+#   MODE B — Custom positions (pixel-perfect, asymmetric layouts)
+#
+# Only one mode is active at a time. If WINDOW_POSITIONS is defined,
+# MODE B is used and the grid settings below are ignored.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MODE A — Auto grid
+# -----------------------------------------------------------------------------
+# Grid dimensions: how many columns and rows of camera windows.
+# The screen is divided evenly into GRID_COLS × GRID_ROWS cells.
+#
+# Common presets:
+#   1 cam  →  GRID_COLS=1  GRID_ROWS=1   (full screen)
+#   2 cams →  GRID_COLS=2  GRID_ROWS=1   (side by side)
+#   2 cams →  GRID_COLS=1  GRID_ROWS=2   (stacked)
+#   4 cams →  GRID_COLS=2  GRID_ROWS=2
+#   6 cams →  GRID_COLS=3  GRID_ROWS=2
+#   9 cams →  GRID_COLS=3  GRID_ROWS=3
+#  12 cams →  GRID_COLS=4  GRID_ROWS=3
+#  16 cams →  GRID_COLS=4  GRID_ROWS=4
+
+GRID_COLS=2
+GRID_ROWS=2
+
+# Pixel gap between windows (0 = no gap, windows touch).
+WINDOW_GAP=4
+
+# -----------------------------------------------------------------------------
+# MODE B — Custom positions  (uncomment to activate)
+# -----------------------------------------------------------------------------
+# Define exact pixel positions for each slot: "X Y WIDTH HEIGHT"
+# This overrides GRID_COLS / GRID_ROWS / WINDOW_GAP.
+#
+# Useful for:
+#   • Asymmetric layouts (one big + several small)
+#   • Non-uniform grids  (e.g. panoramic camera on the bottom)
+#   • Mixed resolutions
+#   • Leaving blank areas on screen
+#
+# Example A — 1 big camera on the left, 2 small on the right (1920×1080):
+# WINDOW_POSITIONS=(
+#     "0    0    1280 1080"   # left:  big view
+#     "1280 0    640  540"    # right-top
+#     "1280 540  640  540"    # right-bottom
+# )
+#
+# Example B — 3×2 grid with a wide panoramic strip at the bottom (1920×1080):
+# WINDOW_POSITIONS=(
+#     "0    0    640  480"    # row1 col1
+#     "640  0    640  480"    # row1 col2
+#     "1280 0    640  480"    # row1 col3
+#     "0    480  960  600"    # bottom-left (wide)
+#     "960  480  960  600"    # bottom-right (wide)
+# )
+#
+# Example C — 4 cameras with visible border (gap of 8px, 1920×1080):
+# WINDOW_POSITIONS=(
+#     "0    0    952  532"    # (1920-8)/2=956, but leave 4px each side
+#     "960  0    952  532"
+#     "0    540  952  532"
+#     "960  540  952  532"
+# )
+
+# WINDOW_POSITIONS=(
+#     "0 0 960 540"
+#     "960 0 960 540"
+#     "0 540 960 540"
+#     "960 540 960 540"
+# )
+
+
+# =============================================================================
+# PAGE ROTATION
+# =============================================================================
+# When you have more cameras than grid slots, PiMonitor creates multiple
+# "pages" and cycles through them automatically.
+#
+# Example: 8 cameras, 2×2 grid → 2 pages (4 cameras each)
+#          Rotation every 30 seconds: page1 → page2 → page1 → ...
+
+# Seconds between page rotations. 0 = disabled (show only the first page).
+ROTATION_INTERVAL=30
+
+# When PiMonitor restarts, should it:
+#   "no"  — resume from the last displayed page  (default)
+#   "yes" — always restart from page 1
+ROTATION_ON_START="no"
+
+
+# =============================================================================
+# PLAYER  (mpv settings)
+# =============================================================================
+
+# Hardware video decoding.
+#
+#   "auto"     — PiMonitor detects the best method (recommended)
+#   "v4l2m2m"  — Raspberry Pi 4 & Pi 5  (V4L2 stateless decode)
+#   "mmal"     — Raspberry Pi 3 and older  (legacy VideoCore)
+#   "vaapi"    — Intel / AMD graphics on x86/x86-64
+#   "nvdec"    — Nvidia GPU
+#   "none"     — Software decode (always works, higher CPU)
+HWDEC="auto"
+
+# RTSP transport protocol.
+#   "tcp"  — reliable, works through NAT and firewalls  (recommended)
+#   "udp"  — lower latency but lossy on busy networks
+RTSP_TRANSPORT="tcp"
+
+# Seconds to wait before reconnecting a dead stream.
+RECONNECT_DELAY=5
+
+# Seconds between launching each camera at startup.
+# Increase if your Pi struggles to open many streams simultaneously.
+STARTUP_DELAY=1
+
+# Read-ahead buffer passed to mpv.
+# Increase ("2M", "4M") for high-latency or remote cameras.
+# Decrease ("128k") to minimise stream latency.
+BUFFER_SIZE="512k"
+
+# Seconds to wait for a stream to open before declaring failure.
+NETWORK_TIMEOUT=30
+
+
+# =============================================================================
+# WATCHDOG
+# =============================================================================
+
+# How often (seconds) the watchdog checks whether streams are still alive.
+# Lower = faster recovery, slightly more CPU.  Recommended: 5–15.
+HEALTH_INTERVAL=5
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+# Log verbosity.
+#   "info"   — normal operation messages
+#   "debug"  — show exact mpv commands, useful for troubleshooting
+LOG_LEVEL="info"
+
+# Optional log file path.  Leave empty to log to journald only.
+# LOG_FILE="/var/log/pimonitor.log"
+LOG_FILE=""
