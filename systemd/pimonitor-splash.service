@@ -1,0 +1,28 @@
+# =============================================================================
+# PiMonitor boot splash
+# =============================================================================
+# Paints a full screen image on the framebuffer from early boot, so the screen
+# shows your branding instead of kernel text while the system starts.
+#
+# The handoff: pimonitor.service stops this unit in its ExecStartPre, right
+# before startx claims the VT. Without that the splash would still own tty1
+# and X could fail to start on it.
+# =============================================================================
+
+[Unit]
+Description=PiMonitor boot splash
+DefaultDependencies=no
+After=local-fs.target
+Before=pimonitor.service getty@tty1.service
+
+[Service]
+Type=simple
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=no
+ExecStart=/usr/bin/fbi -d /dev/fb0 -T 1 --noverbose -a --readahead __INSTALL_DIR__/boot-splash.png
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

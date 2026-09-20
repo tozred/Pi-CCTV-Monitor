@@ -3,7 +3,15 @@
 # =============================================================================
 # Copy to /etc/pimonitor/pimonitor.conf and edit.
 #
-# This file is sourced as Bash, so normal Bash syntax applies.
+# This file is sourced as Bash, so normal Bash syntax applies. A stray quote
+# will stop the service, so check your edits with:
+#     bash -n /etc/pimonitor/pimonitor.conf
+#
+# Do not know your camera URLs? Let the discovery tool find them:
+#     sudo pimonitor-discover --scan 192.168.1.0/24 -u admin -p PASS --config
+#
+# Ready made layouts are in examples/ and the full reference is in
+# docs/CONFIGURATION.md.
 # =============================================================================
 
 
@@ -12,13 +20,13 @@
 # =============================================================================
 # List of RTSP (or HTTP) stream URLs.
 # Each entry is a quoted URL string.
-# Order matters — cameras are laid out in the grid left-to-right, top-to-bottom,
+# Order matters - cameras are laid out in the grid left-to-right, top-to-bottom,
 # then wrapped onto the next page if there are more than grid slots.
 #
 # Common URL formats:
-#   rtsp://USER:PASS@IP/path         — most IP cameras
-#   rtsp://IP/path                   — no auth
-#   http://IP/video.cgi              — MJPEG over HTTP
+#   rtsp://USER:PASS@IP/path         - most IP cameras
+#   rtsp://IP/path                   - no auth
+#   http://IP/video.cgi              - MJPEG over HTTP
 
 CAMERAS=(
     "rtsp://admin:password@192.168.1.10/stream2"
@@ -29,7 +37,7 @@ CAMERAS=(
     "rtsp://admin:password@192.168.1.15/stream2"
 )
 
-# Display names shown in the logs (optional — must match CAMERAS array order)
+# Display names shown in the logs (optional - must match CAMERAS array order)
 CAMERA_NAMES=(
     "Front Door"
     "Backyard"
@@ -49,7 +57,9 @@ XDISPLAY=":0"
 
 # Screen resolution.
 # "auto" detects via xrandr (recommended).
-# Set manually only if auto-detection fails:
+# Set explicitly to force a mode: PiMonitor will switch the display to it via
+# xrandr if the screen supports it. Useful for TVs whose EDID prefers a lower
+# mode (many hotel TVs prefer 1280x720 even though they support 1920x1080).
 SCREEN_WIDTH="auto"
 SCREEN_HEIGHT="auto"
 # SCREEN_WIDTH=1920
@@ -61,15 +71,15 @@ SCREEN_HEIGHT="auto"
 # =============================================================================
 # Two modes available:
 #
-#   MODE A — Auto grid (simple, fills the screen evenly)
-#   MODE B — Custom positions (pixel-perfect, asymmetric layouts)
+#   MODE A - Auto grid (simple, fills the screen evenly)
+#   MODE B - Custom positions (pixel-perfect, asymmetric layouts)
 #
 # Only one mode is active at a time. If WINDOW_POSITIONS is defined,
 # MODE B is used and the grid settings below are ignored.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# MODE A — Auto grid
+# MODE A - Auto grid
 # -----------------------------------------------------------------------------
 # Grid dimensions: how many columns and rows of camera windows.
 # The screen is divided evenly into GRID_COLS × GRID_ROWS cells.
@@ -91,7 +101,7 @@ GRID_ROWS=2
 WINDOW_GAP=4
 
 # -----------------------------------------------------------------------------
-# MODE B — Custom positions  (uncomment to activate)
+# MODE B - Custom positions  (uncomment to activate)
 # -----------------------------------------------------------------------------
 # Define exact pixel positions for each slot: "X Y WIDTH HEIGHT"
 # This overrides GRID_COLS / GRID_ROWS / WINDOW_GAP.
@@ -102,14 +112,14 @@ WINDOW_GAP=4
 #   • Mixed resolutions
 #   • Leaving blank areas on screen
 #
-# Example A — 1 big camera on the left, 2 small on the right (1920×1080):
+# Example A - 1 big camera on the left, 2 small on the right (1920×1080):
 # WINDOW_POSITIONS=(
 #     "0    0    1280 1080"   # left:  big view
 #     "1280 0    640  540"    # right-top
 #     "1280 540  640  540"    # right-bottom
 # )
 #
-# Example B — 3×2 grid with a wide panoramic strip at the bottom (1920×1080):
+# Example B - 3×2 grid with a wide panoramic strip at the bottom (1920×1080):
 # WINDOW_POSITIONS=(
 #     "0    0    640  480"    # row1 col1
 #     "640  0    640  480"    # row1 col2
@@ -118,7 +128,7 @@ WINDOW_GAP=4
 #     "960  480  960  600"    # bottom-right (wide)
 # )
 #
-# Example C — 4 cameras with visible border (gap of 8px, 1920×1080):
+# Example C - 4 cameras with visible border (gap of 8px, 1920×1080):
 # WINDOW_POSITIONS=(
 #     "0    0    952  532"    # (1920-8)/2=956, but leave 4px each side
 #     "960  0    952  532"
@@ -147,8 +157,8 @@ WINDOW_GAP=4
 ROTATION_INTERVAL=30
 
 # When PiMonitor restarts, should it:
-#   "no"  — resume from the last displayed page  (default)
-#   "yes" — always restart from page 1
+#   "no"  - resume from the last displayed page  (default)
+#   "yes" - always restart from page 1
 ROTATION_ON_START="no"
 
 
@@ -158,17 +168,21 @@ ROTATION_ON_START="no"
 
 # Hardware video decoding.
 #
-#   "auto"     — PiMonitor detects the best method (recommended)
-#   "v4l2m2m"  — Raspberry Pi 4 & Pi 5  (V4L2 stateless decode)
-#   "mmal"     — Raspberry Pi 3 and older  (legacy VideoCore)
-#   "vaapi"    — Intel / AMD graphics on x86/x86-64
-#   "nvdec"    — Nvidia GPU
-#   "none"     — Software decode (always works, higher CPU)
+#   "auto"          - PiMonitor detects the best method (recommended)
+#   "v4l2m2m-copy"  - Raspberry Pi 4 & 5 (what "auto" picks on a Pi; the
+#                     direct "v4l2m2m" path can render solid blue on X11)
+#   "none"          - Software decode. USE THIS if you see kernel WARNINGs
+#                     from videobuf2/bcm2835_codec in dmesg, black windows,
+#                     or random crashes (the V4L2 decoder driver is broken on
+#                     some Pi kernels, e.g. 6.18.34+rpt). A Pi 4 software-
+#                     decodes 6-7 sub-streams fine.
+#   "vaapi"         - Intel / AMD graphics on x86/x86-64
+#   "nvdec"         - Nvidia GPU
 HWDEC="auto"
 
 # RTSP transport protocol.
-#   "tcp"  — reliable, works through NAT and firewalls  (recommended)
-#   "udp"  — lower latency but lossy on busy networks
+#   "tcp"  - reliable, works through NAT and firewalls  (recommended)
+#   "udp"  - lower latency but lossy on busy networks
 RTSP_TRANSPORT="tcp"
 
 # Seconds to wait before reconnecting a dead stream.
@@ -186,6 +200,14 @@ BUFFER_SIZE="512k"
 # Seconds to wait for a stream to open before declaring failure.
 NETWORK_TIMEOUT=30
 
+# Per-stream demuxer memory cap. Keep small on Pis with 1-2GB RAM.
+# ("32MiB" default; raise to "64MiB"/"128MiB" only on 4GB+ boards)
+DEMUXER_MAX_BYTES="32MiB"
+
+# Extra mpv flags appended to every stream, space-separated. Advanced use.
+# Example: MPV_EXTRA_OPTS="--profile=low-latency --vo=gpu"
+MPV_EXTRA_OPTS=""
+
 
 # =============================================================================
 # WATCHDOG
@@ -201,8 +223,8 @@ HEALTH_INTERVAL=5
 # =============================================================================
 
 # Log verbosity.
-#   "info"   — normal operation messages
-#   "debug"  — show exact mpv commands, useful for troubleshooting
+#   "info"   - normal operation messages
+#   "debug"  - show exact mpv commands, useful for troubleshooting
 LOG_LEVEL="info"
 
 # Optional log file path.  Leave empty to log to journald only.

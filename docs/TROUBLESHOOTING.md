@@ -1,67 +1,124 @@
 # Troubleshooting
 
-## Quick diagnostics
+Every problem below was hit on a real deployment.
+
+## First look
 
 ```bash
-# Is it running?
-sudo systemctl status pimonitor
-
-# Live log
-sudo journalctl -u pimonitor -f
-
-# Debug — shows exact mpv commands
-sudo PIMONITOR_CONFIG=/etc/pimonitor/pimonitor.conf LOG_LEVEL=debug pimonitor
-
-# Test a stream manually
-DISPLAY=:0 mpv "rtsp://admin:password@192.168.1.10/stream2"
+systemctl status pimonitor          # is it running
+journalctl -u pimonitor -n 50       # why did it stop
+pimonitor status                    # which streams are alive
+vcgencmd measure_temp               # is the Pi too hot
+vcgencmd get_throttled              # 0x0 is healthy
 ```
 
 ---
 
-## Black screen / no cameras
+## Tiles are solid BLUE
 
-**Check 1 — Service status**
+**Cause:** the Pi hardware decoder handing frames to X11. The direct
+`v4l2m2m` path cannot map its frames into the X renderer and paints blue.
 
-```bash
-sudo systemctl status pimonitor
-```
-
-If failed, read the full error:
+**Fix:** use the copy variant, or software decoding.
 
 ```bash
-sudo journalctl -u pimonitor --no-pager -n 50
+# /etc/pimonitor/pimonitor.conf
+HWDEC="v4l2m2m-copy"     # what "auto" now picks on a Pi
+# or, if that still misbehaves:
+HWDEC="none"
 ```
 
-**Check 2 — X11 permissions**
+---
+
+## Tiles are BLACK, or the wall dies at random
+
+**Cause:** on some Raspberry Pi kernels (seen on 6.18.x) the
+`bcm2835_codec` V4L2 driver is broken. It floods the log with
+`__vb2_queue_cancel` warnings, wedges the display, and can take the machine
+down with it.
+
+Check:
 
 ```bash
-cat /etc/X11/Xwrapper.config
+dmesg | grep -c "vb2_queue_cancel"      # anything above 0 is bad
+dmesg | grep -iE "WARNING.*videobuf2"
 ```
 
-Must contain:
-```
-allowed_users = anybody
-needs_root_rights = no
-```
-
-If not, re-run the installer: `sudo bash install.sh`
-
-**Check 3 — Group membership**
+**Fix:** turn hardware decoding off. A Pi 4 handles six sub streams in
+software comfortably.
 
 ```bash
-groups pi
+HWDEC="none"
 ```
 
-Must include `video input render`. If not:
+### A black tile only right after boot
+
+Normal. A camera shows nothing until its first keyframe arrives, which can take
+up to a minute on a stream with a long keyframe interval. It fills in by
+itself. If it is still black after two minutes, treat it as a dead stream.
+
+---
+
+## One camera never appears
+
+Test its URL directly on the Pi:
 
 ```bash
-sudo usermod -aG video,input,render pi
-sudo reboot
+ffprobe -rtsp_transport tcp -i "rtsp://user:pass@192.168.1.10:554/PATH"
 ```
 
-**Check 4 — Stale X11 lock file**
+| Result | Meaning |
+|--------|---------|
+| resolution printed | the URL is fine, the problem is PiMonitor's config |
+| `401 Unauthorized` | wrong username or password |
+| `404 Stream Not Found` | wrong path, see [CAMERAS.md](CAMERAS.md) |
+| hangs with no reply | wrong path on a camera that ignores bad requests |
 
-If the service crashed and left a lock file:
+Then ask the camera what it actually offers:
+
+```bash
+sudo pimonitor-discover 192.168.1.10 -u admin -p PASSWORD
+```
+
+### A stream connects but stays frozen or blank
+
+Some cameras accept the TCP connection and then never send data. PiMonitor
+already passes a demuxer timeout so mpv gives up and the watchdog reconnects.
+If a camera does this constantly, raise the timeout:
+
+```bash
+NETWORK_TIMEOUT=45
+```
+
+---
+
+## Nothing on screen at all
+
+**1. Is the service running**
+
+```bash
+systemctl status pimonitor
+journalctl -u pimonitor -n 50
+```
+
+**2. Is another display manager holding the screen**
+
+A desktop install will fight PiMonitor for tty1.
+
+```bash
+systemctl is-active lightdm gdm3 sddm
+sudo systemctl disable --now lightdm
+sudo systemctl set-default multi-user.target
+```
+
+**3. X permissions**
+
+```bash
+cat /etc/X11/Xwrapper.config     # needs: allowed_users = anybody
+groups pimonitor-user            # needs video, input, render, tty
+```
+
+**4. A stale X lock after a hard crash**
 
 ```bash
 sudo rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
@@ -70,169 +127,145 @@ sudo systemctl restart pimonitor
 
 ---
 
-## Streams not playing / black camera windows
+## The TV says "no signal"
 
-**Test the URL directly:**
+Usually the TV cannot actually do the mode it advertises. One hotel TV reported
+support for 1920x1080 but went dark when driven at it, and only worked at
+1280x720.
 
 ```bash
-DISPLAY=:0 mpv "rtsp://admin:password@192.168.1.10/stream2"
+export DISPLAY=:0
+export XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1)
+xrandr --current          # what the screen really offers
 ```
 
-If this doesn't work, the issue is the URL, credentials, or network — not PiMonitor.
+Pin a mode PiMonitor should force:
 
-**Wrong URL format?** Encode special characters in passwords:
-- `@` → `%40`
-- `#` → `%23`
-- `$` → `%24`
-
-**Network issue?** Try TCP transport in config:
 ```bash
-RTSP_TRANSPORT="tcp"
+SCREEN_WIDTH=1280
+SCREEN_HEIGHT=720
 ```
 
-**Stream times out?** Increase network timeout:
+### Wrong aspect ratio, or a tiny desktop in a corner
+
+Check for a **ghost output**: an HDMI port that reports "connected" with a
+0 byte EDID. X can pick it as primary and set a small mode.
+
 ```bash
-NETWORK_TIMEOUT=60
+for c in /sys/class/drm/card*-HDMI*; do
+  echo "$c: $(cat $c/status) edid_bytes=$(wc -c < $c/edid)"
+done
 ```
+
+An output that is `connected` with `edid_bytes=0` is a ghost. It is usually
+caused by forcing a mode in `cmdline.txt`:
+
+```bash
+# remove any line like this from /boot/firmware/cmdline.txt
+video=HDMI-A-1:1920x1080@60D
+```
+
+Do not force-enable an HDMI port that has nothing plugged into it.
 
 ---
 
-## High CPU / choppy playback
-
-**Hardware decode not working.**
-
-Check in debug mode — you should see `--hwdec=v4l2m2m` in the mpv command.
-
-If hardware decode is falling back to software:
+## Overheating or throttling
 
 ```bash
-# Check V4L2 devices
-ls /dev/video*
-# Should show /dev/video0 /dev/video10 /dev/video11 etc.
+vcgencmd measure_temp
+vcgencmd get_throttled
 ```
 
-If `/dev/video10` is missing:
+`0x80000` means the soft temperature limit was reached. In order of impact:
 
-```bash
-sudo modprobe v4l2-mem2mem
-sudo modprobe bcm2835-codec   # Pi 4
-```
-
-To load on every boot:
-
-```bash
-echo -e "v4l2-mem2mem\nbcm2835-codec" | sudo tee -a /etc/modules
-```
-
-**Using main streams?** Switch to sub-streams:
-
-```bash
-# Instead of /stream1 (1080p), use /stream2 (480p)
-CAMERAS=(
-    "rtsp://admin:pass@192.168.1.10/stream2"
-)
-```
-
-**Too many streams?** Pi 4 can typically handle 4–6 sub-streams at once. Pi 5 can handle more.
+1. Move every camera to its **sub stream**. On one wall this took CPU from
+   145% to 73% and temperature from 79C to 74C with no visible difference.
+2. Fit a heatsink or fan.
+3. Show fewer tiles, or rotate pages instead of all cameras at once.
+4. Lower `SCREEN_WIDTH` and `SCREEN_HEIGHT`. Driving a 4K panel to show SD
+   cameras is wasted work: pin 1920x1080.
 
 ---
 
-## Wrong resolution / misaligned windows
-
-**Check what xrandr detects:**
+## Choppy video or high CPU
 
 ```bash
-DISPLAY=:0 xrandr --current
+ps -o pcpu,rss,comm -C mpv                       # per stream cost
+ps -o pcpu --no-headers -C mpv | paste -sd+ | bc # total
 ```
 
-**Override resolution in config:**
+- Are you on sub streams? This is almost always the answer.
+- A Pi 4 handles roughly 6 sub streams, a Pi 3 about 2 to 3.
+- Lower `DEMUXER_MAX_BYTES` on a 1 GB or 2 GB Pi.
+
+---
+
+## The service restarts in a loop
 
 ```bash
-SCREEN_WIDTH=1920
-SCREEN_HEIGHT=1080
+journalctl -u pimonitor -n 100 --no-pager
+bash -n /etc/pimonitor/pimonitor.conf     # config syntax check
 ```
 
-**Overscan / black borders?** Disable in `/boot/firmware/config.txt`:
+The config is sourced as Bash, so one stray quote stops everything. Check that
+`CAMERAS` is a proper array and that the URLs are quoted.
+
+---
+
+## Restarting takes over a minute
+
+X and mpv sometimes ignore the shutdown signal. The bundled unit caps this with
+`TimeoutStopSec=10`. If you wrote your own unit, add it.
+
+---
+
+## The splash stays and the cameras never appear
+
+The splash must release the VT before X can claim it. Check the drop-in:
+
+```bash
+cat /etc/systemd/system/pimonitor.service.d/10-splash.conf
+```
+
+It must contain:
 
 ```ini
-disable_overscan=1
-```
-
-**Force HDMI resolution** in `/boot/firmware/config.txt`:
-
-```ini
-# 1080p60
-hdmi_group=1
-hdmi_mode=16
+[Service]
+ExecStartPre=-/bin/systemctl stop pimonitor-splash.service
 ```
 
 ---
 
-## Screen goes blank after a while
-
-Disable power management. Run at startup (add to xinitrc or a startup script):
+## Discovery finds nothing
 
 ```bash
-xset s off
-xset -dpms
-xset s noblank
+pimonitor-discover --selftest        # verifies the ONVIF auth crypto
 ```
 
-PiMonitor already calls these on startup. If the display still blanks, check your monitor's own sleep settings.
+If the self test passes but cameras are still not found:
+
+- Is the Pi on the same subnet, and is port 554 open
+  (`nc -z -w2 CAMERA_IP 554`)
+- ONVIF is often **disabled by default**. The tool reports this explicitly.
+  Enable it in the camera web interface.
+- Some cameras keep separate accounts for ONVIF and for RTSP.
+- Rapid repeated failures can trigger a temporary lockout. Wait a minute.
 
 ---
 
-## Service restarts in a loop
+## Reporting a bug
 
-Usually means the config has errors or the display isn't ready.
-
-```bash
-# Run manually to see exact error
-sudo -u pi DISPLAY=:0 PIMONITOR_CONFIG=/etc/pimonitor/pimonitor.conf pimonitor
-```
-
-**Config error?** Check for syntax issues:
+Please include:
 
 ```bash
-bash -n /etc/pimonitor/pimonitor.conf && echo "Syntax OK"
-```
-
----
-
-## GPU memory warning (Pi 4 / Pi 3)
-
-If the log says GPU memory is low:
-
-```bash
-sudo nano /boot/firmware/config.txt
-```
-
-Add:
-
-```ini
-gpu_mem=128
-```
-
-Reboot. Pi 5 does not need this.
-
----
-
-## Getting help
-
-Collect this info before opening an issue:
-
-```bash
-# System info
 uname -a
-cat /etc/os-release
-tr -d '\0' < /sys/firmware/devicetree/base/model 2>/dev/null
-vcgencmd get_mem gpu 2>/dev/null
-
-# Hardware
-ls /dev/video*
-
-# Logs (last 100 lines)
-sudo journalctl -u pimonitor --no-pager -n 100
+cat /etc/os-release | head -2
+tr -d '\0' < /sys/firmware/devicetree/base/model 2>/dev/null; echo
+mpv --version | head -1
+systemctl status pimonitor --no-pager
+journalctl -u pimonitor -n 100 --no-pager
+sed 's|://[^@]*@|://USER:PASS@|g' /etc/pimonitor/pimonitor.conf
 ```
 
-Open an issue at https://github.com/benberlin85/PiMonitor with the above output and your config (replace passwords with `***`).
+That last command strips your camera passwords. Please check the output before
+posting it.

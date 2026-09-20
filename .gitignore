@@ -1,8 +1,12 @@
-# Sensitive — never commit your live config with real passwords
+# Your live config: it contains camera passwords
 pimonitor.conf
-/etc/
+*.conf.local
 
-# Editor
+# Local splash images (use --splash to install your own)
+boot-splash.png
+assets/splash-custom.*
+
+# Editors
 .vscode/
 .idea/
 *.swp
@@ -12,5 +16,7 @@ pimonitor.conf
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and scratch
 *.log
+*.bak
+*.raw

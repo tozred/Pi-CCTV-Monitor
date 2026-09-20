@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pimonitor-discover - find IP cameras and their RTSP stream URLs
+# =============================================================================
+# Pure Bash. Uses ONVIF (the reliable way) and falls back to probing the
+# well-known RTSP paths of common camera makes.
+#
+# Why this exists: the hardest part of building a camera wall is not the wall,
+# it is finding the correct RTSP URL for each camera. Vendors disagree, sub
+# stream paths are undocumented, and some cameras answer EVERY path with the
+# main stream, which makes guessing look like it worked.
+#
+# Usage:
+#   pimonitor-discover --scan 192.168.1.0/24 -u admin -p admin
+#   pimonitor-discover 192.168.1.10 192.168.1.11 -u admin -p secret
+#   pimonitor-discover --scan 10.0.0.0/24 -u admin -p pw --config
+#
+# Output: a report per camera, or with --config a ready to paste CAMERAS=()
+# block for pimonitor.conf.
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="2.0"
+
+USER_NAME=""
+PASSWORD=""
+SUBNET=""
+TARGETS=()
+WANT_CONFIG=false
+PREFER="sub"          # sub | main
+TIMEOUT=6
+PROBE_PATHS=true
+SELFTEST=false
+
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' B='\033[0;34m' D='\033[2m' W='\033[1m' Z='\033[0m'
+info() { echo -e "${B}  >${Z} $*" >&2; }
+ok()   { echo -e "${G}  +${Z} $*" >&2; }
+warn() { echo -e "${Y}  !${Z} $*" >&2; }
+err()  { echo -e "${R}  x${Z} $*" >&2; }
+
+usage() {
+    cat <<EOF
+pimonitor-discover v$VERSION - find cameras and their RTSP URLs
+
+USAGE
+  pimonitor-discover [options] [IP...]
+
+OPTIONS
+  -u, --user USER       camera username
+  -p, --pass PASS       camera password
+  -s, --scan CIDR       scan a /24 subnet, e.g. 192.168.1.0/24
+      --main            prefer the main (high res) stream
+      --sub             prefer the sub (low res) stream [default]
+      --config          print a ready to paste CAMERAS=() block
+      --no-probe        ONVIF only, skip RTSP path guessing
+  -t, --timeout SEC     per request timeout (default $TIMEOUT)
+      --selftest        verify the ONVIF auth crypto, then exit
+  -h, --help            this help
+
+EXAMPLES
+  pimonitor-discover --scan 192.168.1.0/24 -u admin -p admin
+  pimonitor-discover 192.168.1.10 192.168.1.11 -u admin -p secret --config
+
+NOTES
+  Use the SUB stream for multi camera walls. A Pi decodes several small
+  streams comfortably but chokes on several 1080p ones.
+  Some cameras answer every path with the main stream. This tool detects
+  that ("path-ignoring") so you do not chase a sub stream that is switched
+  off in the camera itself.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--user)    USER_NAME="$2"; shift 2 ;;
+        -p|--pass)    PASSWORD="$2"; shift 2 ;;
+        -s|--scan)    SUBNET="$2"; shift 2 ;;
+        --main)       PREFER="main"; shift ;;
+        --sub)        PREFER="sub"; shift ;;
+        --config)     WANT_CONFIG=true; shift ;;
+        --no-probe)   PROBE_PATHS=false; shift ;;
+        -t|--timeout) TIMEOUT="$2"; shift 2 ;;
+        --selftest)   SELFTEST=true; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        -*)           err "unknown option: $1"; usage; exit 1 ;;
+        *)            TARGETS+=("$1"); shift ;;
+    esac
+done
+
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo "pimonitor-discover needs bash 4 or newer (found ${BASH_VERSION})." >&2
+    echo "On macOS: brew install bash, then run it with that bash." >&2
+    exit 1
+fi
+
+for bin in curl openssl; do
+    command -v "$bin" >/dev/null || { err "missing required tool: $bin"; exit 1; }
+done
+PROBE_BIN=""
+command -v ffprobe >/dev/null && PROBE_BIN="ffprobe"
+[[ -z "$PROBE_BIN" ]] && command -v mpv >/dev/null && PROBE_BIN="mpv"
+
+# ---------------------------------------------------------------------------
+# ONVIF: WS-Security UsernameToken (digest) over SOAP
+# ---------------------------------------------------------------------------
+_ws_security() {
+    local user="$1" pass="$2"
+    local nonce_b64 created digest
+    nonce_b64=$(openssl rand -base64 16)
+    created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    # digest = base64( sha1( raw_nonce || created || password ) )
+    digest=$( { printf '%s' "$nonce_b64" | openssl base64 -d -A
+                printf '%s%s' "$created" "$pass"; } \
+              | openssl dgst -sha1 -binary | openssl base64 -A )
+    cat <<EOF
+<wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><wsse:UsernameToken><wsse:Username>${user}</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">${digest}</wsse:Password><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">${nonce_b64}</wsse:Nonce><wsu:Created>${created}</wsu:Created></wsse:UsernameToken></wsse:Security>
+EOF
+}
+
+# Self test: the WS-Security digest must match the published ONVIF vector.
+# openssl's base64 -d silently yields NOTHING without -A when the input has no
+# trailing newline, which would hash an empty nonce and fail auth everywhere.
+_selftest() {
+    local nonce="LKqI6G/AikKCQrN0zqZFlg=="
+    local created="2010-09-16T07:50:45Z"
+    local pass="userpassword"
+    local want="tuOSpGlFlIXsozq4HFNeeGeFLEI="
+    local got
+    got=$( { printf '%s' "$nonce" | openssl base64 -d -A
+             printf '%s%s' "$created" "$pass"; } \
+           | openssl dgst -sha1 -binary | openssl base64 -A )
+    if [[ "$got" == "$want" ]]; then
+        ok "WS-Security digest matches the ONVIF reference vector"
+        return 0
+    fi
+    err "WS-Security digest is WRONG"
+    err "  expected: $want"
+    err "  got     : $got"
+    return 1
+}
+
+_soap() {
+    local ip="$1" port="$2" path="$3" body="$4"
+    local env
+    env="<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Header>$(_ws_security "$USER_NAME" "$PASSWORD")</s:Header><s:Body xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\">${body}</s:Body></s:Envelope>"
+    curl -sk -m "$TIMEOUT" -H 'Content-Type: application/soap+xml; charset=utf-8' \
+         --data-binary "$env" "http://${ip}:${port}${path}" 2>/dev/null
+}
+
+# Find the ONVIF endpoint that answers. Echoes "port path" or nothing.
+_onvif_endpoint() {
+    local ip="$1" resp
+    local -a candidates=(
+        "80 /onvif/device_service" "8000 /onvif/device_service"
+        "8899 /onvif/device_service" "8999 /onvif/device_service"
+        "2020 /onvif/device_service" "80 /onvif/media_service"
+    )
+    for c in "${candidates[@]}"; do
+        local port="${c%% *}" path="${c#* }"
+        resp=$(_soap "$ip" "$port" "$path" '<trt:GetProfiles/>')
+        if [[ "$resp" == *GetProfilesResponse* ]]; then
+            echo "$port $path"; return 0
+        fi
+        # a camera that explicitly says ONVIF is off is still useful to report
+        if [[ "$resp" == *"ONVIF integrate function is disabled"* ]]; then
+            echo "DISABLED $path"; return 1
+        fi
+    done
+    return 1
+}
+
+# Echo lines: "<token>|<encoding>|<width>x<height>|<fps>|<uri>"
+_onvif_profiles() {
+    local ip="$1" port="$2" path="$3" resp
+    resp=$(_soap "$ip" "$port" "$path" '<trt:GetProfiles/>')
+    [[ -z "$resp" ]] && return 1
+
+    # Flatten first: ONVIF responses are pretty printed, and a profile's encoder
+    # details sit on lines after its opening tag. Reading line by line loses them.
+    # After flattening, split so each profile block is exactly one line.
+    printf '%s' "$resp" \
+      | tr '\n\r' '  ' \
+      | awk '{gsub(/<(trt:)?Profiles /, "\n<Profiles "); print}' \
+      | while IFS= read -r chunk; do
+            [[ "$chunk" != "<Profiles "* ]] && continue
+            local tok enc w h fps uri body
+            # Anchor to the start: a flattened chunk also contains the encoder
+            # config's own token=, and a greedy match would return that instead.
+            tok=$(printf '%s' "$chunk" | sed -n 's/^<Profiles [^>]*token="\([^"]*\)".*/\1/p' | head -1)
+            [[ -z "$tok" ]] && continue
+            enc=$(printf '%s' "$chunk" | sed -n 's/.*<tt:Encoding>\([^<]*\)<.*/\1/p' | head -1)
+            w=$(printf '%s' "$chunk" | sed -n 's/.*<tt:Width>\([^<]*\)<.*/\1/p' | head -1)
+            h=$(printf '%s' "$chunk" | sed -n 's/.*<tt:Height>\([^<]*\)<.*/\1/p' | head -1)
+            fps=$(printf '%s' "$chunk" | sed -n 's/.*<tt:FrameRateLimit>\([^<]*\)<.*/\1/p' | head -1)
+            [[ -z "$enc" && -z "$w" ]] && continue
+
+            body="<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>${tok}</trt:ProfileToken></trt:GetStreamUri>"
+            uri=$(_soap "$ip" "$port" "$path" "$body" \
+                  | sed -n 's/.*\(rtsp:\/\/[^<[:space:]]*\).*/\1/p' | head -1)
+            # NOTE: bash 5.2+ treats a bare & in the replacement as "the matched
+            # text", so it must be escaped to mean a literal ampersand.
+            uri=${uri//&amp;/\&}
+            [[ -z "$uri" ]] && continue
+            echo "${tok}|${enc:-?}|${w:-?}x${h:-?}|${fps:-?}|${uri}"
+        done
+}
+
+# ---------------------------------------------------------------------------
+# RTSP probing
+# ---------------------------------------------------------------------------
+# Echo "WIDTHxHEIGHT" if the URL yields video, nothing otherwise.
+_probe_rtsp() {
+    local url="$1"
+    [[ -z "$PROBE_BIN" ]] && return 1
+    if [[ "$PROBE_BIN" == "ffprobe" ]]; then
+        ffprobe -v error -rtsp_transport tcp -timeout $((TIMEOUT*1000000)) \
+                -select_streams v:0 -show_entries stream=width,height \
+                -of csv=p=0:s=x -i "$url" 2>/dev/null | head -1 | tr -d ' '
+    else
+        timeout $((TIMEOUT+6)) mpv --no-config --vo=null --ao=null --frames=3 \
+            --rtsp-transport=tcp "$url" 2>&1 \
+            | sed -n 's/.*(h26[45] \([0-9]*x[0-9]*\).*/\1/p' | head -1
+    fi
+}
+
+_url_with_creds() {
+    local ip="$1" path="$2"
+    if [[ -n "$USER_NAME" ]]; then
+        printf 'rtsp://%s:%s@%s:554%s' "$USER_NAME" "$PASSWORD" "$ip" "$path"
+    else
+        printf 'rtsp://%s:554%s' "$ip" "$path"
+    fi
+}
+
+# Common paths, roughly ordered main/sub per vendor family.
+COMMON_PATHS_MAIN=(
+    "/Streaming/Channels/101" "/ONVIF/channel1" "/cam/realmonitor?channel=1&subtype=0"
+    "/h264Preview_01_main" "/live/ch00_0" "/live/ch0" "/stream1" "/profile1"
+    "/11" "/media/video1" "/0/onvif/profile1/media.smp" "/rtsp_tunnel?h26x=4&line=1&inst=1"
+)
+COMMON_PATHS_SUB=(
+    "/Streaming/Channels/102" "/ONVIF/channel2" "/cam/realmonitor?channel=1&subtype=1"
+    "/h264Preview_01_sub" "/live/ch01_0" "/live/ch1" "/stream2" "/profile2"
+    "/12" "/media/video2" "/0/onvif/profile2/media.smp" "/rtsp_tunnel?h26x=4&line=1&inst=2"
+)
+
+# Detect a camera that serves the same stream for ANY path. Such a camera has
+# its sub stream disabled internally; probing paths on it is meaningless.
+_is_path_ignoring() {
+    local ip="$1" junk res
+    junk=$(_url_with_creds "$ip" "/pimonitor_bogus_path_check_$RANDOM")
+    res=$(_probe_rtsp "$junk")
+    [[ -n "$res" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Per camera
+# ---------------------------------------------------------------------------
+declare -a CONFIG_URLS=()
+declare -a CONFIG_NAMES=()
+
+_examine() {
+    local ip="$1"
+    echo "" >&2
+    echo -e "${W}=== ${ip} ===${Z}" >&2
+
+    local chosen_uri="" chosen_res="" how=""
+
+    # --- 1. ONVIF, the authoritative source -------------------------------
+    local ep port path
+    if ep=$(_onvif_endpoint "$ip"); then
+        port="${ep%% *}"; path="${ep#* }"
+        ok "ONVIF on port ${port}${path}"
+        local -a lines=()
+        mapfile -t lines < <(_onvif_profiles "$ip" "$port" "$path")
+        if [[ ${#lines[@]} -gt 0 ]]; then
+            local best_px=0 smallest_px=999999999
+            for l in "${lines[@]}"; do
+                IFS='|' read -r tok enc res fps uri <<< "$l"
+                echo -e "    ${D}profile${Z} ${tok}: ${enc} ${res} @${fps}fps" >&2
+                echo -e "      ${D}${uri}${Z}" >&2
+                # only consider H264/H265, MJPEG is far too heavy for a wall
+                [[ "$enc" != H26* ]] && continue
+                local w="${res%x*}" h="${res#*x}"
+                [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]] || continue
+                local px=$(( w * h ))
+                if [[ "$PREFER" == "sub" ]]; then
+                    if (( px < smallest_px )); then smallest_px=$px; chosen_uri="$uri"; chosen_res="$res"; fi
+                else
+                    if (( px > best_px )); then best_px=$px; chosen_uri="$uri"; chosen_res="$res"; fi
+                fi
+            done
+            [[ -n "$chosen_uri" ]] && how="onvif"
+        else
+            warn "ONVIF answered but exposed no usable profiles"
+        fi
+    else
+        if [[ "$ep" == DISABLED* ]]; then
+            warn "ONVIF is DISABLED on this camera (enable it in the camera web UI)"
+        else
+            info "no ONVIF endpoint found"
+        fi
+    fi
+
+    # ONVIF URIs usually lack credentials, inject them for convenience
+    if [[ -n "$chosen_uri" && -n "$USER_NAME" && "$chosen_uri" != *"@"* ]]; then
+        chosen_uri="${chosen_uri/rtsp:\/\//rtsp://${USER_NAME}:${PASSWORD}@}"
+    fi
+
+    # --- 2. Fall back to probing known paths -------------------------------
+    if [[ -z "$chosen_uri" && "$PROBE_PATHS" == true && -n "$PROBE_BIN" ]]; then
+        if _is_path_ignoring "$ip"; then
+            warn "this camera answers EVERY path with the same stream"
+            warn "its sub stream is switched off in the camera itself"
+            local u r
+            u=$(_url_with_creds "$ip" "/")
+            r=$(_probe_rtsp "$u")
+            [[ -n "$r" ]] && { chosen_uri="$u"; chosen_res="$r"; how="path-ignoring"; }
+        else
+            local -a list=()
+            if [[ "$PREFER" == "sub" ]]; then
+                list=("${COMMON_PATHS_SUB[@]}")
+            else
+                list=("${COMMON_PATHS_MAIN[@]}")
+            fi
+            info "probing ${#list[@]} known RTSP paths..."
+            for p in "${list[@]}"; do
+                local u r
+                u=$(_url_with_creds "$ip" "$p")
+                r=$(_probe_rtsp "$u")
+                if [[ -n "$r" ]]; then
+                    ok "match: ${p} -> ${r}"
+                    chosen_uri="$u"; chosen_res="$r"; how="probe"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    # --- 3. Verify and record ---------------------------------------------
+    if [[ -n "$chosen_uri" ]]; then
+        if [[ -n "$PROBE_BIN" && "$how" == "onvif" ]]; then
+            local v
+            v=$(_probe_rtsp "$chosen_uri")
+            if [[ -n "$v" ]]; then
+                chosen_res="$v"
+            else
+                warn "ONVIF gave a URL but it did not play with these credentials"
+                warn "some cameras use a SEPARATE account for ONVIF and for RTSP"
+            fi
+        fi
+        ok "USING (${PREFER}, via ${how}): ${chosen_res}"
+        echo -e "    ${G}${chosen_uri}${Z}" >&2
+        CONFIG_URLS+=("$chosen_uri")
+        CONFIG_NAMES+=("CAM-${ip##*.}")
+    else
+        err "no usable stream found on ${ip}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Host discovery
+# ---------------------------------------------------------------------------
+_alive_with_rtsp() {
+    local ip="$1"
+    timeout 2 bash -c "echo > /dev/tcp/${ip}/554" 2>/dev/null
+}
+
+if [[ -n "$SUBNET" ]]; then
+    base="${SUBNET%.*/*}"
+    [[ "$SUBNET" != */24 ]] && { err "--scan supports /24 subnets, e.g. 192.168.1.0/24"; exit 1; }
+    info "scanning ${base}.1-254 for open RTSP (port 554)..."
+    for i in $(seq 1 254); do
+        ( _alive_with_rtsp "${base}.${i}" && echo "${base}.${i}" ) &
+        while [[ $(jobs -rp | wc -l) -ge 64 ]]; do wait -n 2>/dev/null || break; done
+    done > /tmp/.pimon_scan_$$ 2>/dev/null
+    wait
+    mapfile -t found < <(sort -t. -k4 -n /tmp/.pimon_scan_$$ 2>/dev/null)
+    rm -f /tmp/.pimon_scan_$$
+    if [[ ${#found[@]} -eq 0 ]]; then
+        err "no hosts with port 554 open in ${SUBNET}"
+        exit 1
+    fi
+    ok "found ${#found[@]} host(s) with RTSP open"
+    TARGETS+=("${found[@]}")
+fi
+
+if [[ "$SELFTEST" == true ]]; then
+    _selftest; exit $?
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    err "no targets. Pass IPs or use --scan CIDR"
+    usage
+    exit 1
+fi
+
+[[ -z "$PROBE_BIN" ]] && warn "neither ffprobe nor mpv found, cannot verify streams (ONVIF only)"
+
+for ip in "${TARGETS[@]}"; do
+    _examine "$ip"
+done
+
+# ---------------------------------------------------------------------------
+# Config output
+# ---------------------------------------------------------------------------
+echo "" >&2
+if [[ ${#CONFIG_URLS[@]} -eq 0 ]]; then
+    err "nothing found to configure"
+    exit 1
+fi
+ok "${#CONFIG_URLS[@]} camera(s) ready"
+
+if [[ "$WANT_CONFIG" == true ]]; then
+    echo ""
+    echo "# ---- paste into /etc/pimonitor/pimonitor.conf ----"
+    echo "CAMERAS=("
+    for u in "${CONFIG_URLS[@]}"; do printf '    "%s"\n' "$u"; done
+    echo ")"
+    echo "CAMERA_NAMES=("
+    for n in "${CONFIG_NAMES[@]}"; do printf '    "%s"\n' "$n"; done
+    echo ")"
+    n=${#CONFIG_URLS[@]}
+    if   (( n <= 1 )); then c=1; r=1
+    elif (( n <= 2 )); then c=2; r=1
+    elif (( n <= 4 )); then c=2; r=2
+    elif (( n <= 6 )); then c=3; r=2
+    elif (( n <= 9 )); then c=3; r=3
+    else c=4; r=3; fi
+    echo "GRID_COLS=$c"
+    echo "GRID_ROWS=$r"
+    echo "# ---------------------------------------------------"
+else
+    echo ""
+    info "re-run with --config to print a ready to paste CAMERAS block"
+fi
